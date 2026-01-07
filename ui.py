@@ -1,4 +1,3 @@
-# ui_chat.py
 import tkinter as tk
 import threading
 import time

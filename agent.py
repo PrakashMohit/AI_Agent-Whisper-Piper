@@ -1,3 +1,4 @@
+from email.mime import audio
 import sounddevice as sd
 import numpy as np
 import scipy.io.wavfile as wav
@@ -19,7 +20,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 print("Loading Whisper...")
 asr = pipeline(
     "automatic-speech-recognition",
-    model="openai/whisper-large-v3",
+    model="openai/whisper-small",
     device=0 if DEVICE == "cuda" else -1,
     generate_kwargs={
         "language": "en",
@@ -32,18 +33,15 @@ PIPER_EXE = r"D:\AI assistant\piper\piper.exe"
 MODEL = r"D:\AI assistant\piper\models\en_US-amy-medium.onnx"
 
 def piper_tts(text, out_path="reply.wav"):
-    with tempfile.NamedTemporaryFile(delete=False, mode="w", suffix=".txt") as f:
-        f.write(text)
-        txt_path = f.name
-
+     # send text via stdin (avoid temporary txt file)
     subprocess.run(
         [PIPER_EXE, "--model", MODEL, "--output_file", out_path],
-        stdin=open(txt_path, "r"),
+        input=text,
+        text=True,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         check=True
     )
-    os.remove(txt_path)
 
 
 audio_level_queue = queue.Queue()
@@ -67,13 +65,9 @@ def record_audio():
         while time.time() - start_time < DURATION:
             time.sleep(0.01)
 
-    audio = np.concatenate(frames, axis=0)
-    audio = audio.squeeze()
+    audio = np.concatenate(frames, axis=0).squeeze()
     audio = audio / (np.max(np.abs(audio)) + 1e-8)
-
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
-    wav.write(tmp.name, SAMPLE_RATE, (audio * 32767).astype("int16"))
-    return tmp.name
+    return audio  # return numpy array instead of temp wav file
 
 
 
@@ -94,19 +88,27 @@ def ollama_reason(user_text):
     ).strip()
 
 def play_audio(path):
-    subprocess.run(
-        ["ffplay", "-autoexit", "-nodisp", path],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL
-    )
+    # use sounddevice to play WAV (faster than launching ffplay)
+    sr, data = wav.read(path)
+    if data.dtype == np.int16:
+        data = (data.astype("float32") / 32768.0)
+    if data.ndim == 1:
+        sd.play(data, sr)
+    else:
+        sd.play(data, sr, blocking=False)
+    sd.wait()
 
 # UI calling main loop funcion
 def run_agent_once():
-    audio_path = record_audio()
-    result = asr(audio_path)
-    os.remove(audio_path)
-
-    user_text = result["text"].strip()
+    audio= record_audio()
+    # call ASR: pass a dict so sampling_rate is treated as input (not forwarded to model.generate)
+    try:
+        result = asr({"array": audio, "sampling_rate": SAMPLE_RATE})
+    except Exception:
+        # fallback for pipeline implementations that expect a raw array
+        result = asr(audio)
+    user_text = result.get("text", "").strip()
+    
     if not user_text:
         return None, None
 
@@ -114,7 +116,9 @@ def run_agent_once():
 
     piper_tts(reply)
     play_audio("reply.wav")
-    os.remove("reply.wav")
+    try:
+        os.remove("reply.wav")
+    except:
+        pass
 
     return user_text, reply
-
