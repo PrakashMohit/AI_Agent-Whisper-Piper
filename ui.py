@@ -29,7 +29,7 @@ class VoiceUI:
         # ---------- WAVEFORM ----------
         self.canvas = tk.Canvas(
             self.root,
-            width=WIDTH,
+            width=WIDTH -10,
             height=WAVE_HEIGHT,
             bg="white",
             highlightthickness=0
@@ -97,6 +97,7 @@ class VoiceUI:
         self.btn.config(state="disabled")
         threading.Thread(target=self.run_agent, daemon=True).start()
         threading.Thread(target=self.animate_listening, daemon=True).start()
+        self.status.config(text="Processing ...")
 
     def animate_listening(self):
         self.status.config(text="Listening… Speak now")
