@@ -2,3 +2,8 @@ pytorch
 transformer
 piper
 tts
+scipy
+numba
+numpy
+pandas
+sounddevice
