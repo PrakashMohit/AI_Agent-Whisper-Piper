@@ -1,12 +1,8 @@
-from TTS.api import TTS
+import asyncio
+import websockets
 
-tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2")
+async def test():
+    async with websockets.connect("wss://so2ry8z3sw91zl-8765.proxy.runpod.net") as ws:
+        print("✅ Connected!")
 
-tts.tts_to_file(
-    text="Prakash, I remember you. And I’m here.",
-    speaker_wav="voice.wav",
-    file_path="ok.wav",
-    language="en"
-)
-
-print("OK")
+asyncio.run(test())

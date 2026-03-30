@@ -1,168 +1,230 @@
-import sounddevice as sd
-import numpy as np
-import scipy.io.wavfile as wav
-import os
-import subprocess
-import torch
-from transformers import pipeline
+import asyncio
 import queue
+import threading
 import time
-import json
-from pathlib import Path
+import numpy as np
+import sounddevice as sd
+import soundfile as sf
+import websockets
+import io
 
-# ---------------- PATHS ----------------
-BASE_DIR = Path(__file__).parent
-MEMORY_DIR = BASE_DIR / "memory"
-PROFILE_PATH = MEMORY_DIR / "profile.json"
-CHAT_PATH = MEMORY_DIR / "chat_history.json"
+# ─────────────────────────────── CONFIG ──────────────────────────────────────
+RUNPOD_WS_URL  = "wss://jgmzprse0jclmr-8765.proxy.runpod.net"   
 
-MEMORY_DIR.mkdir(exist_ok=True)
+SAMPLE_RATE    = 16000
+MAYA_RATE      = 24000   # server sends 24kHz PCM
 
-# ---------------- CONFIG ----------------
-SAMPLE_RATE = 16000
-DURATION = 5
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-MAX_CHAT_TURNS = 20  # keep memory small & fast
+# VAD
+VAD_SILENCE_THRESHOLD = 0.015
+VAD_SILENCE_DURATION  = 1.0
+VAD_MAX_DURATION      = 12.0
+VAD_MIN_DURATION      = 0.8
 
-# ---------------- LOAD MEMORY ----------------
+# ─────────────────────────── SHARED STATE ────────────────────────────────────
+audio_level_queue: queue.Queue = queue.Queue()
 
-def load_profile():
-    if PROFILE_PATH.exists():
-        with open(PROFILE_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {
-        "user_name": "User",
-        "assistant_name": "Friday",
-        "personality": "calm, emotionally available, supportive"
-    }
+agent_state = {
+    "status":     "idle",
+    "user_text":  "",
+    "reply_text": "",
+}
 
-def load_chat():
-    if CHAT_PATH.exists():
-        with open(CHAT_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return []
+# Callback hooks — ui.py assigns these
+on_status_change  = None   # fn(status: str)
+on_transcript     = None   # fn(text: str)
+on_reply          = None   # fn(text: str)
 
-def save_chat(chat):
-    chat = chat[-MAX_CHAT_TURNS:]
-    with open(CHAT_PATH, "w", encoding="utf-8") as f:
-        json.dump(chat, f, indent=2)
+# ─────────────────────────── VAD RECORDING ───────────────────────────────────
+def record_audio() -> np.ndarray:
+    """Capture mic audio using VAD. Returns float32 array at SAMPLE_RATE."""
+    frames          = []
+    silence_start   = None
+    speech_detected = False
+    start_time      = time.time()
+    WINDOW_SIZE     = 5
 
-profile = load_profile()
-chat_history = load_chat()
-
-# ---------------- LOAD MODELS ----------------
-print("Loading Whisper...")
-asr = pipeline(
-    "automatic-speech-recognition",
-    model="openai/whisper-small",
-    device=0 if DEVICE == "cuda" else -1,
-    generate_kwargs={
-        "language": "en",
-        "task": "transcribe",
-        "temperature": 0.0,
-    }
-)
-
-PIPER_EXE = r"D:\AI assistant\piper\piper.exe"
-MODEL = r"D:\AI assistant\piper\models\en_US-amy-medium.onnx"
-
-def piper_tts(text, out_path="reply.wav"):
-    subprocess.run(
-        [PIPER_EXE, "--model", MODEL, "--output_file", out_path],
-        input=text,
-        text=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        check=True
-    )
-
-# ---------------- AUDIO INPUT ----------------
-
-audio_level_queue = queue.Queue()
-
-def record_audio():
-    frames = []
-    start_time = time.time()
-
-    def callback(indata, frames_count, time_info, status):
+    def callback(indata, frame_count, time_info, status):
         frames.append(indata.copy())
-        audio_level_queue.put(np.abs(indata).mean())
+        audio_level_queue.put(float(np.sqrt(np.mean(indata ** 2))))
 
-    with sd.InputStream(
-        samplerate=SAMPLE_RATE,
-        channels=1,
-        dtype="float32",
-        callback=callback
-    ):
-        while time.time() - start_time < DURATION:
-            time.sleep(0.01)
+    with sd.InputStream(samplerate=SAMPLE_RATE, channels=1,
+                        dtype="float32", callback=callback):
+        while True:
+            elapsed = time.time() - start_time
+            if elapsed > VAD_MAX_DURATION:
+                break
+            time.sleep(0.05)
+            if not frames:
+                continue
+            recent = frames[-WINDOW_SIZE:] if len(frames) >= WINDOW_SIZE else frames
+            rms = float(np.sqrt(np.mean(np.concatenate(recent) ** 2)))
+            if rms > VAD_SILENCE_THRESHOLD:
+                speech_detected = True
+                silence_start   = None
+            elif speech_detected:
+                if silence_start is None:
+                    silence_start = time.time()
+                elif (time.time() - silence_start) >= VAD_SILENCE_DURATION:
+                    if elapsed >= VAD_MIN_DURATION:
+                        break
 
     audio = np.concatenate(frames, axis=0).squeeze()
     audio = audio / (np.max(np.abs(audio)) + 1e-8)
     return audio
 
-# ---------------- LLM WITH MEMORY ----------------
+# ─────────────────────────── AUDIO PLAYER ────────────────────────────────────
+class StreamingPlayer:
+    """Plays incoming float32 PCM chunks in real-time with minimal buffering."""
 
-def build_prompt(user_text):
-    system = (
-        f"You are {profile['assistant_name']}.\n"
-        f"The user's name is {profile['user_name']}.\n"
-        f"Personality: {profile['personality']}.\n"
-        "You remember previous conversations.\n"
-        "Respond naturally and emotionally.\n\n"
-    )
+    def __init__(self, sample_rate: int = MAYA_RATE):
+        self._started = False
+        self._min_buffer = 1   # start fast
+        self._max_buffer = 6   # allow growth
+        self._q: queue.Queue = queue.Queue()
+        self._sr = sample_rate
+        self._stream = sd.OutputStream(
+            samplerate=self._sr,
+            channels=1,
+            dtype="float32",
+            blocksize=4096,
+            callback=self._cb,
+        )
+        self._buf = np.zeros(0, dtype=np.float32)
+        self._stream.start()
+        self._done = False
 
-    history = ""
-    for turn in chat_history:
-        history += f"{turn['role'].capitalize()}: {turn['content']}\n"
+    def _cb(self, outdata, frames, time_info, status):
+        # Pre-buffering logic
+        if not self._started:
+            qsize = self._q.qsize()
 
-    return system + history + f"User: {user_text}\nAssistant:"
+            if qsize < self._min_buffer:
+                outdata[:, 0] = 0
+                return
 
-def ollama_reason(user_text):
-    prompt = build_prompt(user_text)
+            # if buffer is healthy → start immediately
+            if qsize >= self._min_buffer:
+                self._started = True
+        needed = frames
+        out = np.zeros(needed, dtype=np.float32)
+        filled = 0
 
-    reply = subprocess.check_output(
-        ["ollama", "run", "gemma3:4b", prompt],
-        encoding="utf-8",
-        errors="ignore"
-    ).strip()
+        while filled < needed:
+            if len(self._buf) == 0:
+                try:
+                    chunk = self._q.get(timeout=0.1)
+                    if chunk is None:
+                        self._done = True
+                        break
+                    self._buf = chunk
+                except queue.Empty:
+                    break
+            take = min(needed - filled, len(self._buf))
+            out[filled:filled+take] = self._buf[:take]
+            self._buf = self._buf[take:]
+            filled += take
 
-    return reply
+        outdata[:, 0] = out
 
-# ---------------- AUDIO OUTPUT ----------------
+    def push(self, pcm_bytes: bytes):
+        arr = np.frombuffer(pcm_bytes, dtype=np.float32)
+        self._q.put(arr)
 
-def play_audio(path):
-    sr, data = wav.read(path)
-    if data.dtype == np.int16:
-        data = data.astype("float32") / 32768.0
-    sd.play(data, sr)
-    sd.wait()
+    def finish(self):
+        self._q.put(None)
 
-# ---------------- MAIN AGENT CALL ----------------
+    def wait_done(self):
+        """Block until playback buffer is drained."""
+        while not self._q.empty() or len(self._buf) > 0:
+            time.sleep(0.05)
+        time.sleep(0.1)
 
-def run_agent_once():
-    global chat_history
+    def close(self):
+        self._stream.stop()
+        self._stream.close()
 
+# ──────────────────────────── MAIN AGENT CALL ────────────────────────────────
+def _set_status(status: str):
+    agent_state["status"] = status
+    if on_status_change:
+        on_status_change(status)
+
+
+async def _run_agent_async():
+    """Core async pipeline: record → send → receive TTS and play."""
+    # 1. Record
+    _set_status("listening")
     audio = record_audio()
 
+    # 2. Connect and send
+    _set_status("transcribing")
+    raw_pcm = audio.astype(np.float32).tobytes()
+    message = bytes([0x01]) + raw_pcm
+
+    player = None
+    user_text  = ""
+    reply_text = ""
+
     try:
-        result = asr({"array": audio, "sampling_rate": SAMPLE_RATE})
-    except:
-        result = asr(audio)
+        async with websockets.connect(
+            RUNPOD_WS_URL,
+            max_size=50_000_000,
+            ping_interval=20,
+            ping_timeout=60,
+        ) as ws:
+            await ws.send(message)
 
-    user_text = result.get("text", "").strip()
-    if not user_text:
-        return None, None
+            async for msg in ws:
+                if not isinstance(msg, bytes) or len(msg) < 1:
+                    continue
+                mtype   = msg[0]
+                payload = msg[1:]
 
-    reply = ollama_reason(user_text)
+                if mtype == 0x10:   # status
+                    import json
+                    d = json.loads(payload)
+                    _set_status(d.get("status", "idle"))
 
-    # update memory
-    chat_history.append({"role": "user", "content": user_text})
-    chat_history.append({"role": "assistant", "content": reply})
-    save_chat(chat_history)
+                elif mtype == 0x11:  # transcript
+                    user_text = payload.decode("utf-8")
+                    agent_state["user_text"] = user_text
+                    if on_transcript:
+                        on_transcript(user_text)
 
-    piper_tts(reply)
-    play_audio("reply.wav")
-    os.remove("reply.wav")
+                elif mtype == 0x12:  # reply text
+                    reply_text = payload.decode("utf-8")
+                    agent_state["reply_text"] = reply_text
+                    if on_reply:
+                        on_reply(reply_text)
 
-    return user_text, reply
+                elif mtype == 0x13:  # audio chunk
+                    if player is None:
+                        player = StreamingPlayer(sample_rate=MAYA_RATE)
+                    player.push(payload)
+
+                elif mtype == 0x14:  # audio done
+                    if player:
+                        player.finish()
+                        player.wait_done()
+                        player.close()
+                        player = None
+                    break
+
+                elif mtype == 0x15:  # error
+                    print(f"[Server Error] {payload.decode()}")
+                    break
+
+    except Exception as e:
+        print(f"[WebSocket Error] {e}")
+        if player:
+            player.close()
+
+    finally:
+        _set_status("idle")
+
+    return user_text, reply_text
+
+
+def run_agent_once():
+    
+    return asyncio.run(_run_agent_async())
