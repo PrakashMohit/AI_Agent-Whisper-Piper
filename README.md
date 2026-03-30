@@ -18,6 +18,8 @@ Added basic memory to get enough context to have a basic chat with the agent wit
 <h1>Getting Started With Repo</h1>
 <h2>1 Installing Dependencies</h2>
 
+# Update 4 ----><br>
+Now using Ollama Gemma3:4b along with whisper large and official MAYA 1 as tts and running this on cloud using runpod on A40 48 GB Single Gpu 
 ```
 pip install -r requirements.txt
 ```
