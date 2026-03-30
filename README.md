@@ -15,11 +15,13 @@ Ive added a smaller whisper model and updated my program to play audio throug so
 # Update 3 ----><br>
 Added basic memory to get enough context to have a basic chat with the agent without context drop.
 
-<h1>Getting Started With Repo</h1>
-<h2>1 Installing Dependencies</h2>
 
 # Update 4 ----><br>
 Now using Ollama Gemma3:4b along with whisper large and official MAYA 1 as tts and running this on cloud using runpod on A40 48 GB Single Gpu 
+
+<h1>Getting Started With Repo</h1>
+<h2>1 Installing Dependencies</h2>
+
 ```
 pip install -r requirements.txt
 ```
