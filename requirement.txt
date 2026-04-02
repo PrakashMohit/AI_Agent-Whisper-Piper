@@ -1,6 +1,5 @@
 pytorch
 transformer
-piper
 tts
 scipy
 numba
